@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Моя звонилка</title>
+    <style>
+        body { font-family: Arial; padding: 20px; }
+        button { padding: 10px 20px; font-size: 16px; }
+        #status { margin-top: 20px; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <h1>📞 Моя звонилка</h1>
+    <button id="callBtn">🔊 Начать звонок</button>
+    <div id="status">Готов к звонку</div>
+    <div id="log" style="margin-top:10px; font-size:12px; color:gray;"></div>
+
+    <script>
+        // --- 1. HTML-элементы ---
+        const statusDiv = document.getElementById('status');
+        const logDiv = document.getElementById('log');
+        const callBtn = document.getElementById('callBtn');
+
+        // --- 2. Глобальные переменные ---
+        let ws = null;              // WebSocket-соединение с сервером
+        let pc = null;             // PeerConnection (WebRTC)
+        let localStream = null;    // Поток с микрофона
+        let roomId = null;         // ID комнаты
+        let isCreator = false;     // Создатель или подключающийся
+        let isCallActive = false;  // В звонке или нет
+
+        // --- 3. Функция для отправки JSON через WebSocket ---
+        function sendSignal(action, payload = {}) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ action, payload }));
+                log(`📤 Отправлено: ${action}`);
+            } else {
+                log('❌ WebSocket не открыт!');
+            }
+        }
+
+        // --- 4. Функция для логов ---
+        function log(msg) {
+            const time = new Date().toLocaleTimeString();
+            logDiv.innerHTML += `[${time}] ${msg}<br>`;
+        }
+
+        // --- 5. Инициализация WebRTC ---
+        async function initWebRTC() {
+            try {
+                // Запрашиваем доступ к микрофону
+                localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                log('🎤 Микрофон получен');
+
+                // Создаём PeerConnection с STUN-сервером
+                pc = new RTCPeerConnection({
+                    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+                });
+
+                // Добавляем аудио-дорожку в соединение
+                localStream.getTracks().forEach(track => {
+                    pc.addTrack(track, localStream);
+                });
+
+                // Когда получаем аудио от собеседника — воспроизводим
+                pc.ontrack = (event) => {
+                    log('🎧 Получен звук от собеседника');
+                    const audio = new Audio();
+                    audio.srcObject = event.streams[0];
+                    audio.play();
+                };
+
+                // Собираем ICE-кандидаты и отправляем их через сервер
+                pc.onicecandidate = (event) => {
+                    if (event.candidate) {
+                        sendSignal('signal', {
+                            type: 'ice-candidate',
+                            candidate: event.candidate
+                        });
+                    }
+                };
+
+                log('✅ WebRTC инициализирован');
+                return true;
+            } catch (err) {
+                log('❌ Ошибка доступа к микрофону: ' + err.message);
+                return false;
+            }
+        }
+
+        // --- 6. Подключение к серверу сигнализации ---
+        function connectToServer() {
+            ws = new WebSocket('ws://localhost:8765');
+
+            ws.onopen = () => {
+                log('✅ Подключено к серверу');
+                statusDiv.textContent = 'Подключено к серверу. Нажми "Начать звонок"';
+                callBtn.disabled = false;
+            };
+
+            ws.onmessage = async (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    log(`📩 Получено: ${data.type}`);
+
+                    // --- Обработка сообщений от сервера ---
+
+                    // 6a. Сервер сказал, что мы создатель
+                    if (data.type === 'room_ready' && data.role === 'creator') {
+                        isCreator = true;
+                        statusDiv.textContent = 'Ты создатель! Ждём друга...';
+                        log('👑 Ты создатель комнаты');
+                    }
+
+                    // 6b. Сервер сказал, что мы подключились как второй
+                    if (data.type === 'room_ready' && data.role === 'joiner') {
+                        isCreator = false;
+                        statusDiv.textContent = 'Ты подключился! Начинаем звонок...';
+                        log('🤝 Ты подключился как второй');
+                    }
+
+                    // 6c. Оба в комнате — начинаем обмен сигналами
+                    if (data.type === 'both_ready') {
+                        log('👫 Оба в комнате! Начинаем обмен сигналами');
+                        statusDiv.textContent = 'Соединение устанавливается...';
+
+                        if (!pc) {
+                            const ok = await initWebRTC();
+                            if (!ok) return;
+                        }
+
+                        if (isCreator) {
+                            // Создатель создаёт Offer
+                            log('📤 Создаём Offer...');
+                            const offer = await pc.createOffer();
+                            await pc.setLocalDescription(offer);
+                            sendSignal('signal', {
+                                type: 'sdp-offer',
+                                sdp: offer
+                            });
+                        } else {
+                            // Второй участник ждёт Offer
+                            log('⏳ Ждём Offer от создателя...');
+                        }
+                    }
+
+                    // 6d. Получен сигнал (SDP или ICE)
+                    if (data.type === 'signal') {
+                        const payload = data.payload;
+
+                        // Получен SDP Offer
+                        if (payload.type === 'sdp-offer') {
+                            log('📥 Получен Offer, создаём Answer...');
+                            if (!pc) {
+                                const ok = await initWebRTC();
+                                if (!ok) return;
+                            }
+                            await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+                            const answer = await pc.createAnswer();
+                            await pc.setLocalDescription(answer);
+                            sendSignal('signal', {
+                                type: 'sdp-answer',
+                                sdp: answer
+                            });
+                        }
+
+                        // Получен SDP Answer
+                        if (payload.type === 'sdp-answer') {
+                            log('📥 Получен Answer');
+                            if (pc) {
+                                await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+                            }
+                        }
+
+                        // Получен ICE-кандидат
+                        if (payload.type === 'ice-candidate') {
+                            log('📥 Получен ICE-кандидат');
+                            if (pc) {
+                                await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
+                            }
+                        }
+                    }
+
+                    // 6e. Собеседник отключился
+                    if (data.type === 'peer_disconnected') {
+                        log('🚫 Собеседник вышел');
+                        statusDiv.textContent = 'Собеседник вышел';
+                        endCall();
+                    }
+
+                    // 6f. Ошибка
+                    if (data.type === 'error') {
+                        log('❌ Ошибка: ' + data.message);
+                        statusDiv.textContent = 'Ошибка: ' + data.message;
+                    }
+
+                } catch (err) {
+                    log('⚠️ Ошибка обработки: ' + err.message);
+                }
+            };
+
+            ws.onclose = () => {
+                log('🔌 Соединение с сервером закрыто');
+                statusDiv.textContent = 'Отключено от сервера';
+                callBtn.disabled = true;
+                endCall();
+            };
+
+            ws.onerror = (err) => {
+                log('❌ WebSocket ошибка: ' + err);
+            };
+        }
+
+        // --- 7. Завершение звонка ---
+        function endCall() {
+            if (pc) {
+                pc.close();
+                pc = null;
+            }
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+            }
+            isCallActive = false;
+            log('📴 Звонок завершён');
+            statusDiv.textContent = 'Готов к звонку';
+        }
+
+        // --- 8. Обработчик кнопки "Начать звонок" ---
+        callBtn.onclick = () => {
+            if (isCallActive) {
+                // Если звонок уже идёт — завершаем
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.close();
+                }
+                endCall();
+                callBtn.textContent = '🔊 Начать звонок';
+                return;
+            }
+
+            // Если нет соединения — подключаемся
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                log('🔌 Подключаемся к серверу...');
+                connectToServer();
+                callBtn.textContent = '📞 В звонке...';
+                return;
+            }
+
+            // Если уже подключены — создаём комнату
+            log('🏠 Создаём комнату...');
+            sendSignal('create_room');
+            callBtn.textContent = '📞 В звонке...';
+            isCallActive = true;
+        };
+
+        // --- 9. При загрузке страницы ---
+        log('🚀 Страница загружена');
+        statusDiv.textContent = 'Нажми "Начать звонок"';
+        callBtn.textContent = '🔊 Начать звонок';
+
+        // Если страница закрывается — закрываем всё
+        window.onbeforeunload = () => {
+            if (ws) ws.close();
+            endCall();
+        };
+
+    </script>
+</body>
+</html>
